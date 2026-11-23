@@ -548,6 +548,9 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// `CopyMemoryToMemoryX` from memory the GPU does not see: (source, the upload buffer the
+    /// GPU copies from, where it is mapped, bytes) – filled from the source when submitted
+    cpu_reads: Vec<(usize, ID3D12Resource, usize, usize)>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -918,14 +921,39 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
-/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`),
+/// and their upload buffers for copies from it held until the GPU is done.
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
-    let writes: Vec<super::cpu_writes::Write> = {
+    let (writes, keep): (Vec<super::cpu_writes::Write>, Vec<ID3D12Resource>) = {
         let g = LISTS.lock().unwrap();
         let Some(m) = g.as_ref() else { return };
-        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+        let states: Vec<&ListState> = lists.iter().filter_map(|&l| m.get(&(l as usize))).collect();
+        (states.iter().flat_map(|s| s.cpu_writes.iter().cloned()).collect(), states.iter().flat_map(|s| s.cpu_reads.iter().map(|r| r.1.clone())).collect())
     };
     super::cpu_writes::after(queue, writes);
+    super::cpu_writes::hold(queue, keep);
+}
+
+/// Before `lists` go to a queue: the sources of their copies from memory the GPU does not see,
+/// copied into the upload buffers the GPU copies from (what the title wrote by now).
+pub(super) unsafe fn cpu_reads_before(lists: &[*mut c_void]) {
+    let g = LISTS.lock().unwrap();
+    let Some(m) = g.as_ref() else { return };
+    for s in lists.iter().filter_map(|&l| m.get(&(l as usize))) {
+        fill_cpu_reads(&s.cpu_reads);
+    }
+}
+
+unsafe fn fill_cpu_reads(reads: &[(usize, ID3D12Resource, usize, usize)]) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    for &(src, _, mapped, n) in reads {
+        crate::hle::kernelx::lazy::ensure(src, n);
+        if crate::gpu::shader::readable(src, n) {
+            std::ptr::copy_nonoverlapping(src as *const u8, mapped as *mut u8, n);
+        } else {
+            warn(&N, "CopyMemoryToMemoryX", format_args!("{src:#x} ({n:#x} bytes) is no longer readable at submission"));
+        }
+    }
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -974,8 +1002,16 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    let (dst_uma, src_uma) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize));
+    let (Some((d, doff)), Some((s, soff))) = (dst_uma, src_uma) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+        // from the title's own memory: the GPU copies from an upload buffer filled at submission
+        if let (Some((d, doff)), None) = (dst_uma, src_uma) {
+            if copy_from_cpu(this, d, doff, src as usize, size) {
+                note_write(this as usize, dst, size);
+                return;
+            }
+        }
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
@@ -991,6 +1027,46 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// copies from memory the GPU does not see larger than this are not done (one upload buffer each)
+const MAX_CPU_COPY: u64 = 64 << 20;
+
+/// `size` bytes from the title's own memory at `src` to `doff` in window buffer `d`: recorded as a
+/// copy from an upload buffer of the list's that `cpu_reads_before` fills from `src` when the list
+/// is submitted. False when `src` is not readable memory or the buffer cannot be made.
+unsafe fn copy_from_cpu(list: *mut c_void, d: usize, doff: u64, src: usize, size: u64) -> bool {
+    crate::hle::kernelx::lazy::ensure(src, size as usize);
+    if size > MAX_CPU_COPY || !crate::gpu::shader::readable(src, size as usize) {
+        return false;
+    }
+    let Some(dev) = device_of(list) else { return false };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+    let mut up: Option<ID3D12Resource> = None;
+    if dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).is_err() {
+        return false;
+    }
+    let Some(up) = up else { return false };
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if up.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p)).is_err() || p.is_null() {
+        return false;
+    }
+    let raw = up.as_raw() as usize;
+    as_copy_dest(list, d, || copy_buffer_region(list, d, doff, raw, 0, size));
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().cpu_reads.push((src, up, p as usize, size as usize));
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| crate::xlog_info!("D3D12.X: CopyMemoryToMemoryX from memory outside unified memory goes through an upload buffer filled at submission ({size:#x} bytes the first time)"));
+    true
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
@@ -1466,11 +1542,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let cpu_reads = std::mem::take(&mut s.cpu_reads);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes))
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes, cpu_reads))
     };
-    let (sparse_writes, cpu_writes) = sparse_writes;
+    let (sparse_writes, cpu_writes, cpu_reads) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -1498,6 +1575,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
+    fill_cpu_reads(&cpu_reads);
     exec(q_raw, 1, one.as_ptr());
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
@@ -1508,6 +1586,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
     super::cpu_writes::after(q_raw, cpu_writes);
+    super::cpu_writes::hold(q_raw, cpu_reads.into_iter().map(|r| r.1).collect());
 
     let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
@@ -2069,6 +2148,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.clear_sparse_writes();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.cpu_reads.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();

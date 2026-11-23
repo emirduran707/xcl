@@ -512,6 +512,22 @@ pub fn console_list_methods() -> Result<(), String> {
         ensure!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01) && r32(0x200) == 0 && r32(0xFC) == 0, "FillMemoryWith32BitValueX");
         ensure!((0..64).all(|i| *mem.add(0x2000 + i) == i as u8 ^ 0x5A) && *mem.add(0x2040) == 0, "CopyMemoryToMemoryX");
 
+        // 1b. CopyMemoryToMemoryX from the title's own memory (its heap, outside unified memory)
+        // into its graphics memory: the source is what the title wrote by the time it submits
+        let mut own = vec![0u32; 64];
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        copy(l, at(0x3000), own.as_ptr() as u64, 4 * own.len() as u64, 0);
+        list.Close().map_err(e)?;
+        for (i, v) in own.iter_mut().enumerate() {
+            *v = 0xF00D_0000 | i as u32;
+        }
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        let own_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &own_fence, 1)?;
+        ensure!((0..64).all(|i| r32(0x3000 + 4 * i) == 0xF00D_0000 | i as u32), "CopyMemoryToMemoryX from the title's own memory: {:#x}", r32(0x3000));
+        drop(own);
+
         // 2. KickoffX (#93): flushes work to the GPU BEFORE Close() is called, then continues recording
         alloc.Reset().map_err(e)?;
         list.Reset(&alloc, None).map_err(e)?;

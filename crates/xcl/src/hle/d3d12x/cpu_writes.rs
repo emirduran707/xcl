@@ -25,9 +25,11 @@ struct Job {
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
+    /// resources the submission reads: only held, let go with the job once it is done
+    _keep: Vec<ID3D12Resource>,
 }
 
-// SAFETY: the fence is a free-threaded COM object; the writes are plain data
+// SAFETY: the fence and the kept resources are free-threaded COM objects; the writes are plain data
 unsafe impl Send for Job {}
 
 /// queue → its fence and the last value signalled
@@ -95,7 +97,20 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
 
 /// `writes` of lists just submitted to `queue`: done when the GPU has finished them.
 pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
-    if writes.is_empty() || queue.is_null() {
+    if !writes.is_empty() {
+        send(queue, writes, Vec::new());
+    }
+}
+
+/// `keep`, resources that lists just submitted to `queue` read: held until the GPU has finished them.
+pub(super) unsafe fn hold(queue: *mut c_void, keep: Vec<ID3D12Resource>) {
+    if !keep.is_empty() {
+        send(queue, Vec::new(), keep);
+    }
+}
+
+unsafe fn send(queue: *mut c_void, writes: Vec<Write>, keep: Vec<ID3D12Resource>) {
+    if queue.is_null() {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
@@ -118,10 +133,12 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        Job { fence: entry.fence.clone(), value: entry.value, writes, _keep: keep }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
+    if !job.writes.is_empty() {
+        FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
+    }
     let _ = worker().lock().unwrap().send(job);
 }
 

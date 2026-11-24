@@ -508,7 +508,7 @@ struct Pages {
     /// resource → its mapping metadata and currently held pages / extra keys
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
-    waited: std::collections::HashMap<usize, u64>,
+    waited: FenceWaits,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
     reservable_cache: std::collections::HashMap<(i32, u32), bool>,
     /// reusable scratch buffers for `map()`
@@ -520,6 +520,28 @@ struct Pages {
 
 // D3D12 objects are free-threaded
 unsafe impl Send for Pages {}
+
+/// Per-queue last waited fence value on a device's tile-mapping queue.
+#[derive(Default)]
+struct FenceWaits {
+    waited: std::collections::HashMap<usize, u64>,
+}
+
+impl FenceWaits {
+    /// Returns `Some(target)` when `queue` has not yet waited for `target`, recording the wait.
+    fn record_wait(&mut self, queue: usize, target: u64) -> Option<u64> {
+        if self.waited.get(&queue).copied().unwrap_or(0) < target {
+            self.waited.insert(queue, target);
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    fn forget(&mut self, queue: usize) {
+        self.waited.remove(&queue);
+    }
+}
 
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
@@ -552,7 +574,7 @@ impl Pages {
             extra_pages: std::collections::HashMap::new(),
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
-            waited: std::collections::HashMap::new(),
+            waited: FenceWaits::default(),
             reservable_cache: std::collections::HashMap::new(),
             scratch_heaps: Vec::new(),
             scratch_flags: Vec::new(),
@@ -1005,10 +1027,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             let key = queue.as_raw() as usize;
-            if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = queue.Wait(&pages.fence, pages.value);
-                super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
-                pages.waited.insert(key, pages.value);
+            if let Some(target) = pages.waited.record_wait(key, pages.value) {
+                let _ = queue.Wait(&pages.fence, target);
+                super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, target);
             }
             if !pages.retiring.is_empty() {
                 let done_unmap = pages.fence.GetCompletedValue();
@@ -1066,6 +1087,15 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     // Drop fence-completed reclaimed heaps outside all locks so D3D12 Release never blocks
     // concurrent texture placement threads.
     drop(ready_to_drop);
+}
+
+/// A command queue released: forget its last waited fence value so a new queue reusing its
+/// address still waits for `pages.fence`.
+pub(super) fn forget_queue(queue: usize) {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        pages.waited.forget(queue);
+    }
 }
 
 #[cfg(test)]
@@ -1814,5 +1844,19 @@ mod tests {
             );
             assert!(new_calls < old_calls);
         }
+    }
+
+    #[test]
+    fn released_queue_address_rewaits_on_reuse() {
+        let mut waits = FenceWaits::default();
+        let queue_ptr = 0x1000_2000usize;
+        assert_eq!(waits.record_wait(queue_ptr, 5), Some(5));
+        assert_eq!(waits.record_wait(queue_ptr, 5), None);
+        // After the queue is released, a new queue allocated at the same pointer must still wait.
+        waits.forget(queue_ptr);
+        assert_eq!(waits.record_wait(queue_ptr, 5), Some(5));
+        assert_eq!(waits.record_wait(queue_ptr, 5), None);
+        // Advancing the fence requires another wait even without release.
+        assert_eq!(waits.record_wait(queue_ptr, 6), Some(6));
     }
 }
